@@ -22,7 +22,7 @@
 #define MAX_PAY 5  // max payload length
 
 // *** NEW: real-world reaction delays to match the simulator ***
-#define HEARTBEAT_DELAY 10000 // ~10 s heartbeat delay (TAU)
+#define HEARTBEAT_DELAY 14000 // ~10 s heartbeat delay (TAU)
 #define CRYING_DELAY 4000     // ~2 s crying / stress delay
 #define CONVERGENCE_DELAY 4000
 
@@ -318,21 +318,43 @@ static int boot_ping(uint8_t dst)
 // }
 
 // request heartbeat value
+static void drain_my_rx(void)
+{
+  // Drain any already-buffered frames addressed to MSTR.
+  // This prevents "one-cycle behind" by removing late replies from previous requests.
+  while (uart_has_data(UART_CH))
+  {
+    int r = receive_message();
+    if (r < 0) break; // no complete frame available right now
+  }
+}
+
 static int request_heartbeat(void)
 {
+  // 1) Remove any stale/late replies
+  drain_my_rx();
+
+  // 2) Send request
   uint8_t payload[] = {'H'};
   send_message(HRTBT, MSTR, payload);
+
+  // 3) Wait long enough for the heartbeat node to respond (NOT 20 ms)
+  // Start with 200 ms; adjust if needed.
+  const int WAIT_MS = 200;
+
   int waited = 0;
-  while (waited < TIMEOUT)
+  while (waited < WAIT_MS)
   {
     int r = receive_message();
     if (r > 0 && g_src == HRTBT && g_len >= 2 && g_payload[0] == 'H')
       return g_payload[1];
+
     sleep_msec(1);
     waited += 1;
   }
   return -1;
 }
+
 
 // request crying value
 static int request_crying(void)
@@ -448,16 +470,16 @@ static void controller_command_cell(int aIndex, int fIndex)
   if (fIndex > 4)
     fIndex = 4;
 
-  static const uint8_t amp_levels[5] = {20, 40, 60, 80, 100};
-  static const uint8_t freq_levels[5] = {20, 35, 50, 65, 70};
+  // static const uint8_t amp_levels[5] = {5, 20, 40, 60, 80};
+  // static const uint8_t freq_levels[5] = {5, 20, 40, 60, 80};
 
-  uint8_t amp = amp_levels[aIndex];
-  uint8_t freq = freq_levels[fIndex];
+  // uint8_t amp = amp_levels[aIndex];
+  // uint8_t freq = freq_levels[fIndex];
 
   curA = aIndex;
   curF = fIndex;
 
-  command_motor(amp, freq);
+  command_motor(curA, curF);
   // ---- CALM detection (A1F1 == indices 0,0) ----
   // We only count calm if we are NOT in panic mode (panic currently forces A1F1).
   if (!g_calm_reached && !panic_mode && g_algo_start_ms > 0.0 && curA == 0 && curF == 0)
@@ -547,7 +569,7 @@ static void controller_step(int bpm_now, int cry_now)
   int improved = 0; // This will be set to 1 if the helper functions say that the situation actually got better after the last move.
   int same = 0;     // This will be set to 1 if the situation is considered stable
 
-  if (bpm_now < 150 && cry_now < 52) // If the current BPM is below 150, we stop using heart rate as its delayed and focus more on crying as an indicator of stress.
+  if (bpm_now < 150 && (cry_now < 52 && cry_now > 15)) // If the current BPM is below 150, we stop using heart rate as its delayed and focus more on crying as an indicator of stress.
   {
     is_crying_activated = 1;             // We record that in this regime we are using crying as the primary signal to measure improvement.
     improved = crying_improved(cry_now); // We call crying_improved with the current CRY value. returns 1 if crying suggests improvement.
@@ -1301,30 +1323,43 @@ if (get_switch_state(1) == 1)
   g_log_y = g_log_y_start;
   g_log_enabled = 1;
 
-  uint32_t last_poll_ms = 0;
+  //uint32_t last_poll_ms = 0;
   uint32_t last_step_ms = 0;
+
+  // right after boot_ping() and before entering the while(1)
+for (int i = 0; i < 50; i++) {           // ~1 second at 20ms
+  int vhb = request_heartbeat();
+  if (vhb >= 0) last_bpm = (uint8_t)vhb;
+
+  int vcr = request_crying();
+  if (vcr >= 0) last_cry = (uint8_t)vcr;
+
+  if (last_bpm != 0 || last_cry != 0) break;
+  sleep_msec(20);
+}
+
+
+  //int firstTime=1;
   // Main control loop
   while (1)
   {
     uint32_t now = (uint32_t)now_msec();
+
+//     if(firstTime){
+//   sleep_msec(HEARTBEAT_DELAY);
+//   firstTime=0;
+// }
 
     // restart
     if (get_button_state(3))
       restart_program();
 
     // (1) Poll vitals frequently
-    if ((uint32_t)(now - last_poll_ms) >= VITALS_POLL_MS)
-    {
-      last_poll_ms = now;
-
-      int vhb = request_heartbeat();
+    int vhb = request_heartbeat();
       if (vhb >= 0)
         last_bpm = (uint8_t)vhb;
-
-      int vcr = request_crying();
-      if (vcr >= 0)
-        last_cry = (uint8_t)vcr;
-    }
+   
+    last_cry=0;
 
     // (2) Run controller step on your intended cadence (4s or 10s)
     int step_period_ms;
@@ -1425,6 +1460,9 @@ if (get_switch_state(1) == 1)
     }
 
     sleep_msec(delay_ms);
+    
+
+
   }
 
   // unreachable, but for completeness
